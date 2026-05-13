@@ -1,9 +1,8 @@
 # claude-p
 
 > **Use at your own risk.** This package and repository exist for
-> **educational purposes** — to demonstrate why client-side restrictions
-> on how a product is used are fundamentally unenforceable. If a CLI is
-> on your machine, you can drive it.
+> **educational purposes** and demonstrates why client-side restrictions
+> on how a product is used are fundamentally unenforceable.
 
 A drop-in replacement for `claude -p` that drives the interactive
 `claude` UI inside an in-process [zmux][zmux] PTY session.
@@ -59,13 +58,13 @@ Unrecognized flags are forwarded verbatim to `claude`.
 
 ## Exit codes
 
-| Code  | Meaning |
-| ----- | ------- |
-| `0`   | Success. |
+| Code  | Meaning                                                               |
+| ----- | --------------------------------------------------------------------- |
+| `0`   | Success.                                                              |
 | `1`   | Assistant returned an error (`is_error: true`) or transcript missing. |
-| `2`   | Wrapper internal error (PTY failure, spawn failed, etc.). |
-| `124` | Timed out or `--max-turns` exceeded. |
-| `130` | Interrupted (SIGINT). |
+| `2`   | Wrapper internal error (PTY failure, spawn failed, etc.).             |
+| `124` | Timed out or `--max-turns` exceeded.                                  |
+| `130` | Interrupted (SIGINT).                                                 |
 
 ## Caveats
 
