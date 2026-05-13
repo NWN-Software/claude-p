@@ -223,14 +223,16 @@ if (DRY_RUN) {
 // ---------------------------------------------------------------------------
 
 log("npm", "checking auth");
-const who = spawnSync("npm", ["whoami"], { cwd: root, encoding: "utf8" });
-if (who.status === 0) {
-  console.log(`  logged in as ${who.stdout.trim()}`);
-} else if (process.env.NODE_AUTH_TOKEN || process.env.NPM_TOKEN) {
-  console.log("  using token from NODE_AUTH_TOKEN / NPM_TOKEN");
-} else if (!DRY_RUN) {
-  console.log("  not logged in — running `npm login`");
-  run("npm login");
+if (process.env.NODE_AUTH_TOKEN || process.env.NPM_TOKEN) {
+  console.log("  CI: trusting NODE_AUTH_TOKEN / NPM_TOKEN; skipping whoami");
+} else {
+  const who = spawnSync("npm", ["whoami"], { cwd: root, encoding: "utf8" });
+  if (who.status === 0) {
+    console.log(`  logged in as ${who.stdout.trim()}`);
+  } else if (!DRY_RUN) {
+    console.log("  not logged in — running `npm login` (interactive)");
+    run("npm login");
+  }
 }
 
 const otpFlag = OTP ? ` --otp=${OTP}` : "";
