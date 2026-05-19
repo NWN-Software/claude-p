@@ -202,6 +202,13 @@ const ink_max_wait_ms: u64 = 2000;
 /// gap, `\r` lands in the input buffer instead of triggering submit.
 const ink_enter_debounce_ms: u64 = 120;
 
+/// How long the PTY must be silent before we believe a pre-SessionStart
+/// modal dialog (workspace-trust or bypass-permissions) is fully rendered
+/// and ready to accept a keystroke. Typing into a mid-transition Ink frame
+/// can drop the key — observed when bypass dialog appears <200 ms after we
+/// dismiss the trust dialog and our `2` lands on a half-rendered screen.
+const dialog_quiescence_ms: u64 = 80;
+
 /// Block until the child PTY has been quiet for at least `ink_quiescence_ms`,
 /// up to a cap of `ink_max_wait_ms`. Replaces the hardcoded "give Ink time
 /// to settle" sleep from the original fix — adapts to whatever boot latency
@@ -461,11 +468,29 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
         // — after stripping CSI, words concatenate because the dialog
         // separates them with `\033[1C` cursor-move rather than spaces,
         // so we look for multi-distinct-word markers.
+        //
+        // Mutual exclusion is intentional (else-if, not two separate ifs):
+        // the rolling 8 KB `recent` buffer keeps BOTH dialogs' text once
+        // claude transitions from trust → bypass. Without `else if`, the
+        // same iteration that first fires the trust dismiss would also
+        // fire the bypass accept — sending `2`+Enter into a screen that
+        // is still mid-transition. Ink drops the key, claude stays on the
+        // bypass dialog (default "No, exit"), and the SessionStart hook
+        // never fires.
+        //
+        // Each detection also requires PTY quiescence (≥ dialog_quiescence_ms
+        // since the last output byte) before sending a keystroke, so we
+        // don't type into a partially-rendered Ink frame.
         if (state == .waiting_for_ready and (!shared.trust_dismissed or !shared.bypass_perms_accepted)) {
             shared.recent_mutex.lock();
             const stripped = try stripCsi(allocator, shared.recent.items);
             shared.recent_mutex.unlock();
             defer allocator.free(stripped);
+
+            const last_out: i64 = shared.last_output_ns.load(.seq_cst);
+            const now_ns: i64 = @intCast(std.time.nanoTimestamp());
+            const quiescence_ns: i64 = @intCast(dialog_quiescence_ms * std.time.ns_per_ms);
+            const quiescent = last_out != 0 and (now_ns - last_out) > quiescence_ns;
 
             // 1. Workspace-trust dialog: "Is this a project you trust?
             //    1. Yes, I trust this folder / 2. No, exit"
@@ -473,37 +498,50 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
             if (!shared.trust_dismissed) {
                 const has_trust = std.mem.indexOf(u8, stripped, "trust") != null;
                 const has_folder = std.mem.indexOf(u8, stripped, "folder") != null;
-                if (has_trust and has_folder) {
+                if (has_trust and has_folder and quiescent) {
                     trace(opts, trace_start, "workspace-trust dialog detected — sending Enter to dismiss");
                     session.send("", true) catch {};
                     shared.trust_dismissed = true;
+                    // Reset the rolling buffer so the next dialog (bypass)
+                    // is detected only after its own bytes arrive — without
+                    // this, the trust dialog text lingers in the 8 KB window
+                    // and can interfere with subsequent state tracking.
+                    shared.recent_mutex.lock();
+                    shared.recent.clearRetainingCapacity();
+                    shared.recent_mutex.unlock();
+                    // Force a fresh quiescence wait before the next dialog
+                    // fires — claude is about to repaint.
+                    shared.last_output_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
                 }
-            }
-
-            // 2. Bypass-permissions accept dialog: "WARNING: Claude Code
-            //    running in Bypass Permissions mode ... By proceeding,
-            //    you accept all responsibility ... 1. No, exit / 2. Yes,
-            //    I accept". Triggered by --dangerously-skip-permissions
-            //    when the user (or this session's persisted state) hasn't
-            //    accepted it before. Default selection = option 1 (No),
-            //    which exits claude — so we MUST type "2" to move to the
-            //    safe option, THEN Enter to confirm.
-            if (!shared.bypass_perms_accepted) {
+            } else if (!shared.bypass_perms_accepted) {
+                // 2. Bypass-permissions accept dialog: "WARNING: Claude Code
+                //    running in Bypass Permissions mode ... By proceeding,
+                //    you accept all responsibility ... 1. No, exit / 2. Yes,
+                //    I accept". Triggered by --dangerously-skip-permissions
+                //    when the user (or this session's persisted state) hasn't
+                //    accepted it before. Default selection = option 1 (No),
+                //    which exits claude — so we MUST type "2" to move to the
+                //    safe option, THEN Enter to confirm.
                 const has_bypass = std.mem.indexOf(u8, stripped, "Bypass") != null or
                     std.mem.indexOf(u8, stripped, "bypass") != null;
                 const has_permissions = std.mem.indexOf(u8, stripped, "Permissions") != null or
                     std.mem.indexOf(u8, stripped, "permissions") != null;
                 const has_accept = std.mem.indexOf(u8, stripped, "accept") != null;
-                if (has_bypass and has_permissions and has_accept) {
+                if (has_bypass and has_permissions and has_accept and quiescent) {
                     trace(opts, trace_start, "bypass-permissions accept dialog detected — sending '2' + Enter to accept");
-                    // Send "2" to select "Yes, I accept", then Enter.
-                    // Two separate send calls + a short gap so Ink sees
-                    // them as distinct keypresses (same logic as the
-                    // post-SessionStart prompt + Enter split).
+                    // Send "2" to select "Yes, I accept", then Enter. Gap
+                    // matches the prompt+Enter case (ink_enter_debounce_ms);
+                    // shorter gaps (e.g. 50 ms) sometimes get merged by
+                    // Ink's bracketed-paste heuristic and the Enter lands
+                    // in the dialog's text field instead of confirming.
                     session.send("2", false) catch {};
-                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                    std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                     session.send("", true) catch {};
                     shared.bypass_perms_accepted = true;
+                    shared.recent_mutex.lock();
+                    shared.recent.clearRetainingCapacity();
+                    shared.recent_mutex.unlock();
+                    shared.last_output_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
                 }
             }
         }
