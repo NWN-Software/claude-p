@@ -271,6 +271,7 @@ const SharedState = struct {
     recent_mutex: std.Thread.Mutex = .{},
     recent: std.ArrayList(u8) = .{},
     trust_dismissed: bool = false,
+    bypass_perms_accepted: bool = false,
 };
 
 const recent_capacity: usize = 8192;
@@ -453,26 +454,57 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
             allocator.free(bytes);
         }
 
-        // Workspace-trust dialog detection. Claude shows a "Is this a project
-        // you trust?" prompt in unfamiliar directories that blocks startup
-        // *before* SessionStart hooks register and is not bypassed by
-        // --dangerously-skip-permissions. Default selection is "Yes, I trust
-        // this folder"; Enter accepts.
-        if (!shared.trust_dismissed and state == .waiting_for_ready) {
+        // Pre-SessionStart dialog detection. Claude shows several modal
+        // prompts that block startup *before* SessionStart hooks register
+        // and that are not bypassed by --dangerously-skip-permissions.
+        // Detect by substring on the stripped (CSI-removed) recent buffer
+        // — after stripping CSI, words concatenate because the dialog
+        // separates them with `\033[1C` cursor-move rather than spaces,
+        // so we look for multi-distinct-word markers.
+        if (state == .waiting_for_ready and (!shared.trust_dismissed or !shared.bypass_perms_accepted)) {
             shared.recent_mutex.lock();
             const stripped = try stripCsi(allocator, shared.recent.items);
             shared.recent_mutex.unlock();
             defer allocator.free(stripped);
-            // After stripping CSI, words are concatenated (because the dialog
-            // pads with `\033[1C` cursor-move, not real spaces). Search for
-            // two distinct single-word markers both being present in the
-            // pre-SessionStart output stream.
-            const has_trust = std.mem.indexOf(u8, stripped, "trust") != null;
-            const has_folder = std.mem.indexOf(u8, stripped, "folder") != null;
-            if (has_trust and has_folder) {
-                trace(opts, trace_start, "workspace-trust dialog detected — sending Enter to dismiss");
-                session.send("", true) catch {};
-                shared.trust_dismissed = true;
+
+            // 1. Workspace-trust dialog: "Is this a project you trust?
+            //    1. Yes, I trust this folder / 2. No, exit"
+            //    Default selection = option 1 (Yes). Enter accepts.
+            if (!shared.trust_dismissed) {
+                const has_trust = std.mem.indexOf(u8, stripped, "trust") != null;
+                const has_folder = std.mem.indexOf(u8, stripped, "folder") != null;
+                if (has_trust and has_folder) {
+                    trace(opts, trace_start, "workspace-trust dialog detected — sending Enter to dismiss");
+                    session.send("", true) catch {};
+                    shared.trust_dismissed = true;
+                }
+            }
+
+            // 2. Bypass-permissions accept dialog: "WARNING: Claude Code
+            //    running in Bypass Permissions mode ... By proceeding,
+            //    you accept all responsibility ... 1. No, exit / 2. Yes,
+            //    I accept". Triggered by --dangerously-skip-permissions
+            //    when the user (or this session's persisted state) hasn't
+            //    accepted it before. Default selection = option 1 (No),
+            //    which exits claude — so we MUST type "2" to move to the
+            //    safe option, THEN Enter to confirm.
+            if (!shared.bypass_perms_accepted) {
+                const has_bypass = std.mem.indexOf(u8, stripped, "Bypass") != null or
+                    std.mem.indexOf(u8, stripped, "bypass") != null;
+                const has_permissions = std.mem.indexOf(u8, stripped, "Permissions") != null or
+                    std.mem.indexOf(u8, stripped, "permissions") != null;
+                const has_accept = std.mem.indexOf(u8, stripped, "accept") != null;
+                if (has_bypass and has_permissions and has_accept) {
+                    trace(opts, trace_start, "bypass-permissions accept dialog detected — sending '2' + Enter to accept");
+                    // Send "2" to select "Yes, I accept", then Enter.
+                    // Two separate send calls + a short gap so Ink sees
+                    // them as distinct keypresses (same logic as the
+                    // post-SessionStart prompt + Enter split).
+                    session.send("2", false) catch {};
+                    std.Thread.sleep(50 * std.time.ns_per_ms);
+                    session.send("", true) catch {};
+                    shared.bypass_perms_accepted = true;
+                }
             }
         }
 
