@@ -430,7 +430,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !u8 {
         }
 
         // ----- pre-SessionStart modal dialog handling (mirrors driver.run) -----
-        if (state == .waiting_for_ready and (!shared.trust_dismissed or !shared.bypass_perms_accepted)) {
+        if (state == .waiting_for_ready and (!shared.trust_dismissed or !shared.bypass_perms_accepted or !shared.dev_channels_confirmed)) {
             shared.recent_mutex.lock();
             const stripped = try driver_mod.stripCsi(allocator, shared.recent.items);
             shared.recent_mutex.unlock();
@@ -468,6 +468,23 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !u8 {
                     std.Thread.sleep(driver_mod.ink_enter_debounce_ms * std.time.ns_per_ms);
                     session.send("", true) catch {};
                     shared.bypass_perms_accepted = true;
+                    fired_this_iter = true;
+                    shared.recent_mutex.lock();
+                    shared.recent.clearRetainingCapacity();
+                    shared.recent_mutex.unlock();
+                    shared.last_output_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
+                }
+            }
+            // Development-channels confirmation (--dangerously-load-development-channels).
+            // Default selection = option 1 ("I am using this for local development"); bare Enter accepts.
+            if (!shared.dev_channels_confirmed and !fired_this_iter) {
+                const has_loading = std.mem.indexOf(u8, stripped, "Loading") != null;
+                const has_development = std.mem.indexOf(u8, stripped, "development") != null;
+                const has_channels = std.mem.indexOf(u8, stripped, "channels") != null;
+                if (has_loading and has_development and has_channels and quiescent) {
+                    trace(opts, trace_start, "dev-channels dialog detected — Enter");
+                    session.send("", true) catch {};
+                    shared.dev_channels_confirmed = true;
                     fired_this_iter = true;
                     shared.recent_mutex.lock();
                     shared.recent.clearRetainingCapacity();
