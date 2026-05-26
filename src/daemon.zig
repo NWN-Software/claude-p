@@ -195,6 +195,20 @@ fn parseUserMessageContent(allocator: std.mem.Allocator, line: []const u8) !?[]u
     return null;
 }
 
+/// True if `line` is a `{"type":"ping"}` health-probe frame. Cheap classifier
+/// run before `parseUserMessageContent` in the stdin loop so a ping is answered
+/// with a `pong` and never queued as a prompt (see SPEC §2.7).
+fn isPingFrame(allocator: std.mem.Allocator, line: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{
+        .ignore_unknown_fields = true,
+    }) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const tval = parsed.value.object.get("type") orelse return false;
+    if (tval != .string) return false;
+    return std.mem.eql(u8, tval.string, "ping");
+}
+
 /// Read the byte range [start_pos..end_pos) from a file via pread. Caller
 /// owns the returned slice.
 fn readFileRange(allocator: std.mem.Allocator, path: []const u8, start_pos: u64, end_pos: u64) ![]u8 {
@@ -280,6 +294,20 @@ fn emitSystemInit(writer: *std.Io.Writer, session_id: []const u8) !void {
     try jw.write("init");
     try jw.objectField("session_id");
     try jw.write(session_id);
+    try jw.endObject();
+    try writer.writeAll("\n");
+}
+
+/// Emit a `{"type":"pong","ts":<unix_ms>}` health-probe response. Produced by
+/// the main event loop in reply to a `ping` frame; its arrival proves the loop
+/// is not wedged (see SPEC §2.7).
+fn emitPong(writer: *std.Io.Writer) !void {
+    var jw = std.json.Stringify{ .writer = writer, .options = .{} };
+    try jw.beginObject();
+    try jw.objectField("type");
+    try jw.write("pong");
+    try jw.objectField("ts");
+    try jw.write(std.time.milliTimestamp());
     try jw.endObject();
     try writer.writeAll("\n");
 }
@@ -616,7 +644,11 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !u8 {
             }
             while (std.mem.indexOfScalar(u8, stdin_buf.items, '\n')) |nl| {
                 const line = stdin_buf.items[0..nl];
-                if (try parseUserMessageContent(allocator, line)) |content| {
+                if (isPingFrame(allocator, line)) {
+                    // Answered inline by the main loop — proves the loop is live.
+                    emitPong(stdout) catch {};
+                    stdout.flush() catch {};
+                } else if (try parseUserMessageContent(allocator, line)) |content| {
                     try prompt_queue.append(allocator, content);
                 }
                 std.mem.copyForwards(u8, stdin_buf.items, stdin_buf.items[nl + 1 ..]);
@@ -693,6 +725,34 @@ test "parseUserMessageContent: non-user type returns null" {
 
 test "parseUserMessageContent: malformed returns null" {
     try testing.expectEqual(@as(?[]u8, null), try parseUserMessageContent(testing.allocator, "not json"));
+}
+
+test "isPingFrame: ping frame recognized" {
+    try testing.expect(isPingFrame(testing.allocator, "{\"type\":\"ping\"}"));
+    try testing.expect(isPingFrame(testing.allocator, "{\"type\":\"ping\",\"id\":7}"));
+}
+
+test "isPingFrame: user frame is not a ping" {
+    const line = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}";
+    try testing.expect(!isPingFrame(testing.allocator, line));
+}
+
+test "isPingFrame: malformed / non-ping returns false" {
+    try testing.expect(!isPingFrame(testing.allocator, "not json"));
+    try testing.expect(!isPingFrame(testing.allocator, "{\"type\":\"system\"}"));
+    try testing.expect(!isPingFrame(testing.allocator, "{\"foo\":1}"));
+}
+
+test "emitPong: shape is a single-line pong object with ts" {
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(testing.allocator);
+    var aw = std.Io.Writer.Allocating.fromArrayList(testing.allocator, &buf);
+    try emitPong(&aw.writer);
+    buf = aw.toArrayList();
+    const out = buf.items;
+    try testing.expect(std.mem.endsWith(u8, out, "\n"));
+    try testing.expect(std.mem.indexOf(u8, out, "\"type\":\"pong\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"ts\":") != null);
 }
 
 test "idleTimedOut: busy + stale last_output trips" {
