@@ -439,9 +439,31 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !u8 {
     const session_start_deadline_ns: i128 = trace_start + @as(i128, @intCast(opts.session_start_timeout_ms)) * std.time.ns_per_ms;
     var stdin_eof = false;
 
+    // PTY byte-rate trace: emit one structured line per interval so we can
+    // see whether Ink keeps rendering during a real wedge (spinner ticking
+    // → pty_delta > 0) vs. a fully stuck process (pty_delta == 0).
+    const pty_trace_interval_ns: i128 = 60 * std.time.ns_per_s;
+    var next_pty_trace_ns: i128 = trace_start + pty_trace_interval_ns;
+    var last_pty_bytes_seen: u64 = 0;
+
     while (true) {
         // ----- timeout checks -----
         const now_ns: i128 = std.time.nanoTimestamp();
+
+        if (now_ns >= next_pty_trace_ns) {
+            const cur_bytes = shared.bytes_seen.load(.seq_cst);
+            const delta = cur_bytes - last_pty_bytes_seen;
+            const last_out: i64 = shared.last_output_ns.load(.seq_cst);
+            const last_out_age_ms: i64 = if (last_out == 0) -1 else @intCast(@divTrunc(now_ns - @as(i128, last_out), std.time.ns_per_ms));
+            const turn_age_ms: i64 = if (turn_start_ns == 0) -1 else @intCast(@divTrunc(now_ns - turn_start_ns, std.time.ns_per_ms));
+            const transcript_pos: u64 = if (tailer) |t| t.pos else 0;
+            std.debug.print("[pty-trace] state={s} pty_bytes={d} pty_delta={d} last_byte_age_ms={d} turn_age_ms={d} transcript_pos={d}\n", .{
+                @tagName(state), cur_bytes, delta, last_out_age_ms, turn_age_ms, transcript_pos,
+            });
+            last_pty_bytes_seen = cur_bytes;
+            next_pty_trace_ns = now_ns + pty_trace_interval_ns;
+        }
+
         if (state == .waiting_for_ready and now_ns > session_start_deadline_ns) {
             return RunError.SessionStartTimeout;
         }
