@@ -442,7 +442,29 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !u8 {
     // PTY byte-rate trace: emit one structured line per interval so we can
     // see whether Ink keeps rendering during a real wedge (spinner ticking
     // → pty_delta > 0) vs. a fully stuck process (pty_delta == 0).
-    const pty_trace_interval_ns: i128 = 60 * std.time.ns_per_s;
+    //
+    // Configurable via CLAUDE_P_PTY_TRACE:
+    //   unset                  -> default 60s interval
+    //   "0"/"off"/"false"/"no" -> disabled (no trace lines)
+    //   <positive integer>     -> interval in seconds
+    var pty_trace_enabled = true;
+    var pty_trace_interval_ns: i128 = 60 * std.time.ns_per_s;
+    if (std.posix.getenv("CLAUDE_P_PTY_TRACE")) |raw| {
+        const v = std.mem.trim(u8, raw, " \t\r\n");
+        if (v.len == 0) {
+            // empty -> keep default
+        } else if (std.mem.eql(u8, v, "0") or
+            std.ascii.eqlIgnoreCase(v, "off") or
+            std.ascii.eqlIgnoreCase(v, "false") or
+            std.ascii.eqlIgnoreCase(v, "no"))
+        {
+            pty_trace_enabled = false;
+        } else if (std.fmt.parseInt(u32, v, 10)) |secs| {
+            if (secs > 0) pty_trace_interval_ns = @as(i128, secs) * std.time.ns_per_s;
+        } else |_| {
+            // unparseable -> keep default 60s
+        }
+    }
     var next_pty_trace_ns: i128 = trace_start + pty_trace_interval_ns;
     var last_pty_bytes_seen: u64 = 0;
 
@@ -450,7 +472,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !u8 {
         // ----- timeout checks -----
         const now_ns: i128 = std.time.nanoTimestamp();
 
-        if (now_ns >= next_pty_trace_ns) {
+        if (pty_trace_enabled and now_ns >= next_pty_trace_ns) {
             const cur_bytes = shared.bytes_seen.load(.seq_cst);
             const delta = cur_bytes - last_pty_bytes_seen;
             const last_out: i64 = shared.last_output_ns.load(.seq_cst);
